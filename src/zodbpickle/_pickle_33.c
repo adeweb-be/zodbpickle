@@ -100,6 +100,21 @@ PyAPI_FUNC(size_t) _PyLong_NumBits(PyObject *v);
 #  define PyFloat_Unpack8 _PyFloat_Unpack8
 #endif
 
+#if (PY_VERSION_HEX < 0x30D0000) /* 3.13.0 */
+/**
+ * ``PyDict_GetItemRef`` is new in 3.13. This version keeps the behaviour
+ * of ``PyDict_GetItem``: it ignores errors.
+ */
+static int PyDict_GetItemRef(PyObject *mp, PyObject *key, PyObject **result)
+{
+    *result = PyDict_GetItem(mp, key);
+    if (*result == NULL)
+        return 0;
+    Py_INCREF(*result);
+    return 1;
+}
+#endif
+
 /* Bump this when new opcodes are added to the pickle protocol. */
 enum {
     HIGHEST_PROTOCOL = 3,
@@ -229,6 +244,18 @@ static PyObject *import_mapping_3to2 = NULL;
 /* XXX: Are these really nescessary? */
 /* As the name says, an empty tuple. */
 static PyObject *empty_tuple = NULL;
+
+/* codecs.encode */
+static PyObject *codecs_encode = NULL;
+/* Interned strings */
+static PyObject *module_str = NULL;
+static PyObject *main_str = NULL;
+static PyObject *name_str = NULL;
+static PyObject *str_class = NULL;
+static PyObject *newobj_str = NULL;
+static PyObject *reduce_str = NULL;
+static PyObject *reduce_ex_str = NULL;
+static PyObject *latin1 = NULL;
 
 static int
 stack_underflow(void)
@@ -1424,21 +1451,10 @@ static PyObject *
 whichmodule(PyObject *global, PyObject *global_name)
 {
     Py_ssize_t i, j;
-    static PyObject *module_str = NULL;
-    static PyObject *main_str = NULL;
     PyObject *module_name;
     PyObject *modules_dict;
     PyObject *module;
     PyObject *obj;
-
-    if (module_str == NULL) {
-        module_str = PyUnicode_InternFromString("__module__");
-        if (module_str == NULL)
-            return NULL;
-        main_str = PyUnicode_InternFromString("__main__");
-        if (main_str == NULL)
-            return NULL;
-    }
 
     module_name = PyObject_GetAttr(global, module_str);
 
@@ -1462,6 +1478,11 @@ whichmodule(PyObject *global, PyObject *global_name)
     modules_dict = PySys_GetObject("modules");
     if (modules_dict == NULL)
         return NULL;
+    /* Iterate over a copy. PyObject_GetAttr() can run code that changes
+       sys.modules, and other threads can change it too. */
+    modules_dict = PyDict_Copy(modules_dict);
+    if (modules_dict == NULL)
+        return NULL;
 
     i = 0;
     module_name = NULL;
@@ -1473,8 +1494,10 @@ whichmodule(PyObject *global, PyObject *global_name)
         if (obj == NULL) {
             if (PyErr_ExceptionMatches(PyExc_AttributeError))
                 PyErr_Clear();
-            else
+            else {
+                Py_DECREF(modules_dict);
                 return NULL;
+            }
             continue;
         }
 
@@ -1493,6 +1516,7 @@ whichmodule(PyObject *global, PyObject *global_name)
     }
 
     Py_INCREF(module_name);
+    Py_DECREF(modules_dict);
     return module_name;
 }
 
@@ -1858,38 +1882,19 @@ save_bytes(PicklerObject *self, PyObject *obj)
            Python 2 *and* the appropriate 'bytes' object when unpickled
            using Python 3. Again this is a hack and we don't need to do this
            with newer protocols. */
-        static PyObject *codecs_encode = NULL;
         PyObject *reduce_value = NULL;
         int status;
-
-        if (codecs_encode == NULL) {
-            PyObject *codecs_module = PyImport_ImportModule("codecs");
-            if (codecs_module == NULL) {
-                return -1;
-            }
-            codecs_encode = PyObject_GetAttrString(codecs_module, "encode");
-            Py_DECREF(codecs_module);
-            if (codecs_encode == NULL) {
-                return -1;
-            }
-        }
 
         if (PyBytes_GET_SIZE(obj) == 0) {
             reduce_value = Py_BuildValue("(O())", (PyObject*)&PyBytes_Type);
         }
         else {
-            static PyObject *latin1 = NULL;
             PyObject *unicode_str =
                 PyUnicode_DecodeLatin1(PyBytes_AS_STRING(obj),
                                        PyBytes_GET_SIZE(obj),
                                        "strict");
             if (unicode_str == NULL)
                 return -1;
-            if (latin1 == NULL) {
-                latin1 = PyUnicode_InternFromString("latin1");
-                if (latin1 == NULL)
-                    return -1;
-            }
             reduce_value = Py_BuildValue("(O(OO))",
                                          codecs_encode, unicode_str, latin1);
             Py_DECREF(unicode_str);
@@ -2727,7 +2732,6 @@ save_dict(PicklerObject *self, PyObject *obj)
 static int
 save_global(PicklerObject *self, PyObject *obj, PyObject *name)
 {
-    static PyObject *name_str = NULL;
     PyObject *global_name = NULL;
     PyObject *module_name = NULL;
     PyObject *module = NULL;
@@ -2735,12 +2739,6 @@ save_global(PicklerObject *self, PyObject *obj, PyObject *name)
     int status = 0;
 
     const char global_op = GLOBAL;
-
-    if (name_str == NULL) {
-        name_str = PyUnicode_InternFromString("__name__");
-        if (name_str == NULL)
-            goto error;
-    }
 
     if (name) {
         global_name = name;
@@ -2801,7 +2799,11 @@ save_global(PicklerObject *self, PyObject *obj, PyObject *name)
         if (extension_key == NULL) {
             goto error;
         }
-        code_obj = PyDict_GetItem(extension_registry, extension_key);
+        if (PyDict_GetItemRef(extension_registry, extension_key,
+                              &code_obj) < 0) {
+            Py_DECREF(extension_key);
+            goto error;
+        }
         Py_DECREF(extension_key);
         /* The object is not registered in the extension registry.
            This is the most likely code path. */
@@ -2817,9 +2819,11 @@ save_global(PicklerObject *self, PyObject *obj, PyObject *name)
             PyErr_Format(PicklingError,
                          "Can't pickle %R: extension code %R isn't an integer",
                          obj, code_obj);
+            Py_DECREF(code_obj);
             goto error;
         }
         code = PyLong_AS_LONG(code_obj);
+        Py_DECREF(code_obj);
         if (code <= 0 || code > 0x7fffffffL) {
             if (!PyErr_Occurred())
                 PyErr_Format(PicklingError,
@@ -3095,13 +3099,7 @@ static PyObject *
 get_class(PyObject *obj)
 {
     PyObject *cls;
-    static PyObject *str_class;
 
-    if (str_class == NULL) {
-        str_class = PyUnicode_InternFromString("__class__");
-        if (str_class == NULL)
-            return NULL;
-    }
     cls = PyObject_GetAttr(obj, str_class);
     if (cls == NULL) {
         if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
@@ -3178,15 +3176,7 @@ save_reduce(PicklerObject *self, PyObject *args, PyObject *obj)
     /* Protocol 2 special case: if callable's name is __newobj__, use
        NEWOBJ. */
     if (use_newobj) {
-        static PyObject *newobj_str = NULL, *name_str = NULL;
         PyObject *name;
-
-        if (newobj_str == NULL) {
-            newobj_str = PyUnicode_InternFromString("__newobj__");
-            name_str = PyUnicode_InternFromString("__name__");
-            if (newobj_str == NULL || name_str == NULL)
-                return -1;
-        }
 
         name = PyObject_GetAttr(callable, name_str);
         if (name == NULL) {
@@ -3416,10 +3406,9 @@ save(PicklerObject *self, PyObject *obj, int pers_save)
      * __reduce_ex__ method, or the object's __reduce__ method.
      */
     if (self->dispatch_table == NULL) {
-        reduce_func = PyDict_GetItem(dispatch_table, (PyObject *)type);
-        /* PyDict_GetItem() unlike PyObject_GetItem() and
-           PyObject_GetAttr() returns a borrowed ref */
-        Py_XINCREF(reduce_func);
+        if (PyDict_GetItemRef(dispatch_table, (PyObject *)type,
+                              &reduce_func) < 0)
+            goto error;
     } else {
         reduce_func = PyObject_GetItem(self->dispatch_table, (PyObject *)type);
         if (reduce_func == NULL) {
@@ -3438,19 +3427,6 @@ save(PicklerObject *self, PyObject *obj, int pers_save)
         goto done;
     }
     else {
-        static PyObject *reduce_str = NULL;
-        static PyObject *reduce_ex_str = NULL;
-
-        /* Cache the name of the reduce methods. */
-        if (reduce_str == NULL) {
-            reduce_str = PyUnicode_InternFromString("__reduce__");
-            if (reduce_str == NULL)
-                goto error;
-            reduce_ex_str = PyUnicode_InternFromString("__reduce_ex__");
-            if (reduce_ex_str == NULL)
-                goto error;
-        }
-
         /* XXX: If the __reduce__ method is defined, __reduce_ex__ is
            automatically defined as __reduce__. While this is convenient, this
            make it impossible to know which method was actually called. Of
@@ -5112,16 +5088,22 @@ load_extension(UnpicklerObject *self, int nbytes)
     py_code = PyLong_FromLong(code);
     if (py_code == NULL)
         return -1;
-    obj = PyDict_GetItem(extension_cache, py_code);
+    if (PyDict_GetItemRef(extension_cache, py_code, &obj) < 0) {
+        Py_DECREF(py_code);
+        return -1;
+    }
     if (obj != NULL) {
         /* Bingo. */
         Py_DECREF(py_code);
-        PDATA_APPEND(self->stack, obj, -1);
+        PDATA_PUSH(self->stack, obj, -1);
         return 0;
     }
 
     /* Look up the (module_name, class_name) pair. */
-    pair = PyDict_GetItem(inverted_registry, py_code);
+    if (PyDict_GetItemRef(inverted_registry, py_code, &pair) < 0) {
+        Py_DECREF(py_code);
+        return -1;
+    }
     if (pair == NULL) {
         Py_DECREF(py_code);
         PyErr_Format(PyExc_ValueError, "unregistered extension "
@@ -5135,12 +5117,14 @@ load_extension(UnpicklerObject *self, int nbytes)
         !PyUnicode_Check(module_name = PyTuple_GET_ITEM(pair, 0)) ||
         !PyUnicode_Check(class_name = PyTuple_GET_ITEM(pair, 1))) {
         Py_DECREF(py_code);
+        Py_DECREF(pair);
         PyErr_Format(PyExc_ValueError, "_inverted_registry[%ld] "
                      "isn't a 2-tuple of strings", code);
         return -1;
     }
     /* Load the object. */
     obj = find_class(self, module_name, class_name);
+    Py_DECREF(pair);
     if (obj == NULL) {
         Py_DECREF(py_code);
         return -1;
@@ -6165,7 +6149,6 @@ static PyObject *
 Unpickler_find_class(UnpicklerObject *self, PyObject *args)
 {
     PyObject *global;
-    PyObject *modules_dict;
     PyObject *module;
     PyObject *module_name, *global_name;
 
@@ -6226,23 +6209,16 @@ Unpickler_find_class(UnpicklerObject *self, PyObject *args)
         }
     }
 
-    modules_dict = PySys_GetObject("modules");
-    if (modules_dict == NULL)
-        return NULL;
-
-    module = PyDict_GetItemWithError(modules_dict, module_name);
+    module = PyImport_GetModule(module_name);
     if (module == NULL) {
         if (PyErr_Occurred())
             return NULL;
         module = PyImport_Import(module_name);
         if (module == NULL)
             return NULL;
-        global = PyObject_GetAttr(module, global_name);
-        Py_DECREF(module);
     }
-    else {
-        global = PyObject_GetAttr(module, global_name);
-    }
+    global = PyObject_GetAttr(module, global_name);
+    Py_DECREF(module);
     return global;
 }
 
@@ -7029,6 +7005,7 @@ initmodule(void)
 {
     PyObject *copyreg = NULL;
     PyObject *compat_pickle = NULL;
+    PyObject *codecs = NULL;
 
     /* XXX: We should ensure that the types of the dictionaries imported are
        exactly PyDict objects. Otherwise, it is possible to crash the pickle
@@ -7102,6 +7079,39 @@ initmodule(void)
     if (empty_tuple == NULL)
         goto error;
 
+    codecs = PyImport_ImportModule("codecs");
+    if (!codecs)
+        goto error;
+    codecs_encode = PyObject_GetAttrString(codecs, "encode");
+    if (!codecs_encode)
+        goto error;
+    Py_CLEAR(codecs);
+
+    module_str = PyUnicode_InternFromString("__module__");
+    if (!module_str)
+        goto error;
+    main_str = PyUnicode_InternFromString("__main__");
+    if (!main_str)
+        goto error;
+    name_str = PyUnicode_InternFromString("__name__");
+    if (!name_str)
+        goto error;
+    str_class = PyUnicode_InternFromString("__class__");
+    if (!str_class)
+        goto error;
+    newobj_str = PyUnicode_InternFromString("__newobj__");
+    if (!newobj_str)
+        goto error;
+    reduce_str = PyUnicode_InternFromString("__reduce__");
+    if (!reduce_str)
+        goto error;
+    reduce_ex_str = PyUnicode_InternFromString("__reduce_ex__");
+    if (!reduce_ex_str)
+        goto error;
+    latin1 = PyUnicode_InternFromString("latin1");
+    if (!latin1)
+        goto error;
+
     return 0;
 
   error:
@@ -7116,6 +7126,16 @@ initmodule(void)
     Py_CLEAR(name_mapping_3to2);
     Py_CLEAR(import_mapping_3to2);
     Py_CLEAR(empty_tuple);
+    Py_CLEAR(codecs);
+    Py_CLEAR(codecs_encode);
+    Py_CLEAR(module_str);
+    Py_CLEAR(main_str);
+    Py_CLEAR(name_str);
+    Py_CLEAR(str_class);
+    Py_CLEAR(newobj_str);
+    Py_CLEAR(reduce_str);
+    Py_CLEAR(reduce_ex_str);
+    Py_CLEAR(latin1);
     return -1;
 }
 
@@ -7151,6 +7171,10 @@ PyInit__pickle(void)
     m = PyModule_Create(&_picklemodule);
     if (m == NULL)
         return NULL;
+#ifdef Py_GIL_DISABLED
+    /* This module can run without the GIL. */
+    PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED);
+#endif
 
     Py_INCREF(&Pickler_Type);
     if (PyModule_AddObject(m, "Pickler", (PyObject *)&Pickler_Type) < 0)

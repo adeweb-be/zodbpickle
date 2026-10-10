@@ -4,6 +4,13 @@ Change log
 4.6 (unreleased)
 ----------------
 
+- Declare free-threading support in the C extension, so that importing it on
+  CPython 3.14t no longer enables the GIL. Interned strings and
+  ``codecs.encode`` are now created at module init instead of on first use,
+  the ``copyreg`` registries are read with strong references on Python 3.13+,
+  ``whichmodule`` iterates over a copy of ``sys.modules``, and
+  ``Unpickler.find_class`` holds a strong reference to the module.
+
 
 4.5 (2026-08-20)
 ----------------
