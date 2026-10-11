@@ -92,6 +92,21 @@ static int PyDict_GetItemRef(PyObject *mp, PyObject *key, PyObject **result)
     Py_INCREF(*result);
     return 1;
 }
+
+/**
+ * ``PyList_GetItemRef`` is new in 3.13. It returns a strong reference, or
+ * NULL with ``IndexError`` set.
+ */
+static PyObject *PyList_GetItemRef(PyObject *op, Py_ssize_t i)
+{
+    PyObject *item = PyList_GetItem(op, i);
+    Py_XINCREF(item);
+    return item;
+}
+
+/* Critical sections are new in 3.13. Without them, the GIL is the lock. */
+#  define Py_BEGIN_CRITICAL_SECTION(op) {
+#  define Py_END_CRITICAL_SECTION() }
 #endif
 
 /* Bump this when new opcodes are added to the pickle protocol. */
@@ -2375,6 +2390,7 @@ batch_list_exact(PicklerObject *self, PyObject *obj)
 {
     PyObject *item = NULL;
     Py_ssize_t this_batch, total;
+    int status;
 
     const char append_op = APPEND;
     const char appends_op = APPENDS;
@@ -2385,8 +2401,14 @@ batch_list_exact(PicklerObject *self, PyObject *obj)
     assert(PyList_CheckExact(obj));
 
     if (PyList_GET_SIZE(obj) == 1) {
-        item = PyList_GET_ITEM(obj, 0);
-        if (save(self, item, 0) < 0)
+        /* save() can run code that changes the list, and other threads can
+           change it too. Keep a strong reference to the item. */
+        item = PyList_GetItemRef(obj, 0);
+        if (item == NULL)
+            return -1;
+        status = save(self, item, 0);
+        Py_DECREF(item);
+        if (status < 0)
             return -1;
         if (_Pickler_Write(self, &append_op, 1) < 0)
             return -1;
@@ -2400,8 +2422,12 @@ batch_list_exact(PicklerObject *self, PyObject *obj)
         if (_Pickler_Write(self, &mark_op, 1) < 0)
             return -1;
         while (total < PyList_GET_SIZE(obj)) {
-            item = PyList_GET_ITEM(obj, total);
-            if (save(self, item, 0) < 0)
+            item = PyList_GetItemRef(obj, total);
+            if (item == NULL)
+                return -1;
+            status = save(self, item, 0);
+            Py_DECREF(item);
+            if (status < 0)
                 return -1;
             total++;
             if (++this_batch == BATCHSIZE)
@@ -2621,7 +2647,7 @@ batch_dict(PicklerObject *self, PyObject *iter)
  * Note that this currently doesn't work for protocol 0.
  */
 static int
-batch_dict_exact(PicklerObject *self, PyObject *obj)
+batch_dict_exact_impl(PicklerObject *self, PyObject *obj)
 {
     PyObject *key = NULL, *value = NULL;
     int i;
@@ -2639,10 +2665,14 @@ batch_dict_exact(PicklerObject *self, PyObject *obj)
     /* Special-case len(d) == 1 to save space. */
     if (dict_size == 1) {
         PyDict_Next(obj, &ppos, &key, &value);
+        Py_INCREF(key);
+        Py_INCREF(value);
         if (save(self, key, 0) < 0)
-            return -1;
+            goto error;
         if (save(self, value, 0) < 0)
-            return -1;
+            goto error;
+        Py_CLEAR(key);
+        Py_CLEAR(value);
         if (_Pickler_Write(self, &setitem_op, 1) < 0)
             return -1;
         return 0;
@@ -2654,10 +2684,14 @@ batch_dict_exact(PicklerObject *self, PyObject *obj)
         if (_Pickler_Write(self, &mark_op, 1) < 0)
             return -1;
         while (PyDict_Next(obj, &ppos, &key, &value)) {
+            Py_INCREF(key);
+            Py_INCREF(value);
             if (save(self, key, 0) < 0)
-                return -1;
+                goto error;
             if (save(self, value, 0) < 0)
-                return -1;
+                goto error;
+            Py_CLEAR(key);
+            Py_CLEAR(value);
             if (++i == BATCHSIZE)
                 break;
         }
@@ -2672,6 +2706,24 @@ batch_dict_exact(PicklerObject *self, PyObject *obj)
 
     } while (i == BATCHSIZE);
     return 0;
+error:
+    Py_XDECREF(key);
+    Py_XDECREF(value);
+    return -1;
+}
+
+/* save() can run code that changes the dict, and other threads can change
+   it too. The critical section keeps the PyDict_Next() position valid on
+   the free-threaded build. The section pauses when save() blocks, so the
+   loop also keeps strong references to the key and the value. */
+static int
+batch_dict_exact(PicklerObject *self, PyObject *obj)
+{
+    int status;
+    Py_BEGIN_CRITICAL_SECTION(obj);
+    status = batch_dict_exact_impl(self, obj);
+    Py_END_CRITICAL_SECTION();
+    return status;
 }
 
 static int
