@@ -44,44 +44,23 @@ static int _PyLong_AsByteArray_compat(PyLongObject* v,
 #define _PyLong_AsByteArray(v, bytes, n, little_endian, is_signed) _PyLong_AsByteArray_compat(v, bytes, n, little_endian, is_signed)
 #endif
 
+/**
+ * Return 1 if ``obj`` has the attribute ``name``, 0 if it does not, and -1
+ * on an error other than ``AttributeError``.
+ */
+static int
+has_attr(PyObject *obj, PyObject *name)
+{
+    int result;
+    PyObject *value;
 #if (PY_VERSION_HEX >= 0x30D00A1) /* 3.13.0a1 */
-
-/**
- * In 3.13a1 ``_PyObject_LookupAttrId`` was removed.
- * See https://github.com/python/cpython/commit/579aa89e68a6607398317a50586af781981e89fb
- * See also the explanation for 3.10 below.
- */
-static int _PyObject_HasAttrId(PyObject* obj, void* id)
-{
-    int result;
-    PyObject *oname = _PyUnicode_FromId(id); /* borrowed */
-    if (!oname) {
-        return -1;
-    }
-    PyObject* attr_val;
-    result = PyObject_GetOptionalAttr(obj, oname, &attr_val);
-    Py_XDECREF(attr_val);
-    return result;
-}
-
-#elif (PY_VERSION_HEX >= 0x30A00B1) /* 3.10.0b1 */
-
-/**
- * The function ``_PyObject_LookupAttrId`` function replaces the combo of
- * ``_PyObject_HasAttrId`` followed by ``_PyObject_GetAttrId``; our code isn't
- * structured to take advantage of that, so for now we throw away the
- * resulting attribute value and continue to make the extra ``Get`` call.
- */
-static int _PyObject_HasAttrId(PyObject* obj, void* id)
-{
-    int result;
-    PyObject* attr_val;
-    result = _PyObject_LookupAttrId(obj, id, &attr_val);
-    Py_XDECREF(attr_val);
-    return result;
-}
-
+    result = PyObject_GetOptionalAttr(obj, name, &value);
+#else
+    result = _PyObject_LookupAttr(obj, name, &value);
 #endif
+    Py_XDECREF(value);
+    return result;
+}
 
 /*
 * This declaration was moved to the internal API only accessible for building
@@ -247,7 +226,8 @@ static PyObject *empty_tuple = NULL;
 
 /* codecs.encode */
 static PyObject *codecs_encode = NULL;
-/* Interned strings */
+/* Interned strings. initmodule() creates them, and they do not change after
+   that, so all threads can read them without a lock. */
 static PyObject *module_str = NULL;
 static PyObject *main_str = NULL;
 static PyObject *name_str = NULL;
@@ -256,6 +236,48 @@ static PyObject *newobj_str = NULL;
 static PyObject *reduce_str = NULL;
 static PyObject *reduce_ex_str = NULL;
 static PyObject *latin1 = NULL;
+static PyObject *write_str = NULL;
+static PyObject *peek_str = NULL;
+static PyObject *read_str = NULL;
+static PyObject *readline_str = NULL;
+static PyObject *items_str = NULL;
+static PyObject *persistent_id_str = NULL;
+static PyObject *dispatch_table_str = NULL;
+static PyObject *find_class_str = NULL;
+static PyObject *getinitargs_str = NULL;
+static PyObject *new_str = NULL;
+static PyObject *append_str = NULL;
+static PyObject *setstate_str = NULL;
+static PyObject *dict_str = NULL;
+static PyObject *persistent_load_str = NULL;
+
+static const struct {
+    PyObject **ref;
+    const char *value;
+} interned_strings[] = {
+    {&module_str, "__module__"},
+    {&main_str, "__main__"},
+    {&name_str, "__name__"},
+    {&str_class, "__class__"},
+    {&newobj_str, "__newobj__"},
+    {&reduce_str, "__reduce__"},
+    {&reduce_ex_str, "__reduce_ex__"},
+    {&latin1, "latin1"},
+    {&write_str, "write"},
+    {&peek_str, "peek"},
+    {&read_str, "read"},
+    {&readline_str, "readline"},
+    {&items_str, "items"},
+    {&persistent_id_str, "persistent_id"},
+    {&dispatch_table_str, "dispatch_table"},
+    {&find_class_str, "find_class"},
+    {&getinitargs_str, "__getinitargs__"},
+    {&new_str, "__new__"},
+    {&append_str, "append"},
+    {&setstate_str, "__setstate__"},
+    {&dict_str, "__dict__"},
+    {&persistent_load_str, "persistent_load"},
+};
 
 static int
 stack_underflow(void)
@@ -951,9 +973,8 @@ _Pickler_SetProtocol(PicklerObject *self, PyObject *proto_obj,
 static int
 _Pickler_SetOutputStream(PicklerObject *self, PyObject *file)
 {
-    _Py_IDENTIFIER(write);
     assert(file != NULL);
-    self->write = _PyObject_GetAttrId(file, &PyId_write);
+    self->write = PyObject_GetAttr(file, write_str);
     if (self->write == NULL) {
         if (PyErr_ExceptionMatches(PyExc_AttributeError))
             PyErr_SetString(PyExc_TypeError,
@@ -1299,19 +1320,15 @@ _Unpickler_New(void)
 static int
 _Unpickler_SetInputStream(UnpicklerObject *self, PyObject *file)
 {
-    _Py_IDENTIFIER(peek);
-    _Py_IDENTIFIER(read);
-    _Py_IDENTIFIER(readline);
-
-    self->peek = _PyObject_GetAttrId(file, &PyId_peek);
+    self->peek = PyObject_GetAttr(file, peek_str);
     if (self->peek == NULL) {
         if (PyErr_ExceptionMatches(PyExc_AttributeError))
             PyErr_Clear();
         else
             return -1;
     }
-    self->read = _PyObject_GetAttrId(file, &PyId_read);
-    self->readline = _PyObject_GetAttrId(file, &PyId_readline);
+    self->read = PyObject_GetAttr(file, read_str);
+    self->readline = PyObject_GetAttr(file, readline_str);
     if (self->readline == NULL || self->read == NULL) {
         if (PyErr_ExceptionMatches(PyExc_AttributeError))
             PyErr_SetString(PyExc_TypeError,
@@ -2699,9 +2716,7 @@ save_dict(PicklerObject *self, PyObject *obj)
             status = batch_dict_exact(self, obj);
             Py_LeaveRecursiveCall();
         } else {
-            _Py_IDENTIFIER(items);
-
-            items = _PyObject_CallMethodId(obj, &PyId_items, "()");
+            items = PyObject_CallMethodNoArgs(obj, items_str);
             if (items == NULL)
                 goto error;
             iter = PyObject_GetIter(items);
@@ -3648,8 +3663,6 @@ Pickler_init(PicklerObject *self, PyObject *args, PyObject *kwds)
     PyObject *file;
     PyObject *proto_obj = NULL;
     PyObject *fix_imports = Py_True;
-    _Py_IDENTIFIER(persistent_id);
-    _Py_IDENTIFIER(dispatch_table);
 
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|OO:Pickler",
                                      kwlist, &file, &proto_obj, &fix_imports))
@@ -3685,16 +3698,16 @@ Pickler_init(PicklerObject *self, PyObject *args, PyObject *kwds)
     self->fast_nesting = 0;
     self->fast_memo = NULL;
     self->pers_func = NULL;
-    if (_PyObject_HasAttrId((PyObject *)self, &PyId_persistent_id)) {
-        self->pers_func = _PyObject_GetAttrId((PyObject *)self,
-                                              &PyId_persistent_id);
+    if (has_attr((PyObject *)self, persistent_id_str)) {
+        self->pers_func = PyObject_GetAttr((PyObject *)self,
+                                           persistent_id_str);
         if (self->pers_func == NULL)
             return -1;
     }
     self->dispatch_table = NULL;
-    if (_PyObject_HasAttrId((PyObject *)self, &PyId_dispatch_table)) {
-        self->dispatch_table = _PyObject_GetAttrId((PyObject *)self,
-                                                   &PyId_dispatch_table);
+    if (has_attr((PyObject *)self, dispatch_table_str)) {
+        self->dispatch_table = PyObject_GetAttr((PyObject *)self,
+                                                dispatch_table_str);
         if (self->dispatch_table == NULL)
             return -1;
     }
@@ -4044,10 +4057,8 @@ static PyTypeObject Pickler_Type = {
 static PyObject *
 find_class(UnpicklerObject *self, PyObject *module_name, PyObject *global_name)
 {
-    _Py_IDENTIFIER(find_class);
-
-    return _PyObject_CallMethodId((PyObject *)self, &PyId_find_class, "OO",
-                                  module_name, global_name);
+    return PyObject_CallMethodObjArgs((PyObject *)self, find_class_str,
+                                      module_name, global_name, NULL);
 }
 
 static Py_ssize_t
@@ -4683,19 +4694,16 @@ static PyObject *
 instantiate(PyObject *cls, PyObject *args)
 {
     PyObject *result = NULL;
-    _Py_IDENTIFIER(__getinitargs__);
     /* Caller must assure args are a tuple.  Normally, args come from
        Pdata_poptuple which packs objects from the top of the stack
        into a newly created tuple. */
     assert(PyTuple_Check(args));
     if (Py_SIZE(args) > 0 || !PyType_Check(cls) ||
-        _PyObject_HasAttrId(cls, &PyId___getinitargs__)) {
+        has_attr(cls, getinitargs_str)) {
         result = PyObject_CallObject(cls, args);
     }
     else {
-        _Py_IDENTIFIER(__new__);
-
-        result = _PyObject_CallMethodId(cls, &PyId___new__, "O", cls);
+        result = PyObject_CallMethodOneArg(cls, new_str, cls);
     }
     return result;
 }
@@ -5244,9 +5252,8 @@ do_append(UnpicklerObject *self, Py_ssize_t x)
     }
     else {
         PyObject *append_func;
-        _Py_IDENTIFIER(append);
 
-        append_func = _PyObject_GetAttrId(list, &PyId_append);
+        append_func = PyObject_GetAttr(list, append_str);
         if (append_func == NULL)
             return -1;
         for (i = x; i < len; i++) {
@@ -5335,7 +5342,6 @@ load_build(UnpicklerObject *self)
     PyObject *state, *inst, *slotstate;
     PyObject *setstate;
     int status = 0;
-    _Py_IDENTIFIER(__setstate__);
 
     /* Stack is ... instance, state.  We want to leave instance at
      * the stack top, possibly mutated via instance.__setstate__(state).
@@ -5349,7 +5355,7 @@ load_build(UnpicklerObject *self)
 
     inst = self->stack->data[Py_SIZE(self->stack) - 1];
 
-    setstate = _PyObject_GetAttrId(inst, &PyId___setstate__);
+    setstate = PyObject_GetAttr(inst, setstate_str);
     if (setstate == NULL) {
         if (PyErr_ExceptionMatches(PyExc_AttributeError))
             PyErr_Clear();
@@ -5392,13 +5398,12 @@ load_build(UnpicklerObject *self)
         PyObject *dict;
         PyObject *d_key, *d_value;
         Py_ssize_t i;
-        _Py_IDENTIFIER(__dict__);
 
         if (!PyDict_Check(state)) {
             PyErr_SetString(UnpicklingError, "state is not a dictionary");
             goto error;
         }
-        dict = _PyObject_GetAttrId(inst, &PyId___dict__);
+        dict = PyObject_GetAttr(inst, dict_str);
         if (dict == NULL)
             goto error;
 
@@ -6327,7 +6332,6 @@ Unpickler_init(UnpicklerObject *self, PyObject *args, PyObject *kwds)
     PyObject *fix_imports = Py_True;
     char *encoding = NULL;
     char *errors = NULL;
-    _Py_IDENTIFIER(persistent_load);
 
     /* XXX: That is an horrible error message. But, I don't know how to do
        better... */
@@ -6362,9 +6366,9 @@ Unpickler_init(UnpicklerObject *self, PyObject *args, PyObject *kwds)
     if (self->fix_imports == -1)
         return -1;
 
-    if (_PyObject_HasAttrId((PyObject *)self, &PyId_persistent_load)) {
-        self->pers_func = _PyObject_GetAttrId((PyObject *)self,
-                                              &PyId_persistent_load);
+    if (has_attr((PyObject *)self, persistent_load_str)) {
+        self->pers_func = PyObject_GetAttr((PyObject *)self,
+                                           persistent_load_str);
         if (self->pers_func == NULL)
             return -1;
     }
@@ -7006,6 +7010,7 @@ initmodule(void)
     PyObject *copyreg = NULL;
     PyObject *compat_pickle = NULL;
     PyObject *codecs = NULL;
+    size_t i;
 
     /* XXX: We should ensure that the types of the dictionaries imported are
        exactly PyDict objects. Otherwise, it is possible to crash the pickle
@@ -7087,30 +7092,12 @@ initmodule(void)
         goto error;
     Py_CLEAR(codecs);
 
-    module_str = PyUnicode_InternFromString("__module__");
-    if (!module_str)
-        goto error;
-    main_str = PyUnicode_InternFromString("__main__");
-    if (!main_str)
-        goto error;
-    name_str = PyUnicode_InternFromString("__name__");
-    if (!name_str)
-        goto error;
-    str_class = PyUnicode_InternFromString("__class__");
-    if (!str_class)
-        goto error;
-    newobj_str = PyUnicode_InternFromString("__newobj__");
-    if (!newobj_str)
-        goto error;
-    reduce_str = PyUnicode_InternFromString("__reduce__");
-    if (!reduce_str)
-        goto error;
-    reduce_ex_str = PyUnicode_InternFromString("__reduce_ex__");
-    if (!reduce_ex_str)
-        goto error;
-    latin1 = PyUnicode_InternFromString("latin1");
-    if (!latin1)
-        goto error;
+    for (i = 0; i < Py_ARRAY_LENGTH(interned_strings); i++) {
+        *interned_strings[i].ref =
+            PyUnicode_InternFromString(interned_strings[i].value);
+        if (!*interned_strings[i].ref)
+            goto error;
+    }
 
     return 0;
 
@@ -7128,14 +7115,8 @@ initmodule(void)
     Py_CLEAR(empty_tuple);
     Py_CLEAR(codecs);
     Py_CLEAR(codecs_encode);
-    Py_CLEAR(module_str);
-    Py_CLEAR(main_str);
-    Py_CLEAR(name_str);
-    Py_CLEAR(str_class);
-    Py_CLEAR(newobj_str);
-    Py_CLEAR(reduce_str);
-    Py_CLEAR(reduce_ex_str);
-    Py_CLEAR(latin1);
+    for (i = 0; i < Py_ARRAY_LENGTH(interned_strings); i++)
+        Py_CLEAR(*interned_strings[i].ref);
     return -1;
 }
 
