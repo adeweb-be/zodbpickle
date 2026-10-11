@@ -1,8 +1,8 @@
 Change log
 ==========
 
-4.6 (unreleased)
-----------------
+4.5+zoe.1 (unreleased)
+----------------------
 
 - Declare free-threading support in the C extension, so that importing it on
   CPython 3.14t no longer enables the GIL. Interned strings and
@@ -10,6 +10,17 @@ Change log
   the ``copyreg`` registries are read with strong references on Python 3.13+,
   ``whichmodule`` iterates over a copy of ``sys.modules``, and
   ``Unpickler.find_class`` holds a strong reference to the module.
+
+- Make the C extension safe without the GIL. All interned strings are created
+  at module init, and the extension no longer uses ``_Py_IDENTIFIER``. The
+  pickler iterates over an exact dict in a critical section on the dict, and
+  holds strong references to the items of an exact list and to the keys and
+  values of an exact dict while it saves them. A ``Pickler`` or an
+  ``Unpickler`` object is still meant for one thread at a time.
+
+- Add a stress test that pickles and unpickles from many threads at once,
+  while another thread changes the ``copyreg`` tables, ``sys.modules`` and
+  the shared containers.
 
 
 4.5 (2026-08-20)
